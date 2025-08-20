@@ -71,8 +71,8 @@ keymap: dict[int, Callable[[bool], None]] = {
     ecodes.KEY_J: simple_button(uinput.BTN_THUMBL),
     # Emote
     ecodes.KEY_K: simple_button(uinput.BTN_THUMBR),
-    # idk if this is used anywhere
-    # ???: simple_button(uinput.BTN_START),
+    # Join game (local multiplayer)
+    ecodes.KEY_4: simple_button(uinput.BTN_START),
 }
 
 device = uinput.Device(
