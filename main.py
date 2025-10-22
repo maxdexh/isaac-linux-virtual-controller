@@ -1,19 +1,14 @@
-import dataclasses
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
 import functools
-from typing import Self
+from typing import Literal
 
 import uinput  # type: ignore
 import evdev  # type: ignore
 from evdev import KeyEvent, ecodes
 
-
 type InKey = int
 type OutEvent = tuple[int, int]
 type OutEventValue = int
-type Keymap = Mapping[InKey, KeyAction]
-type Keybind = tuple[InKey, KeyAction]
 
 # Values for pressed and released.
 # Also used for the analog shoulder triggers
@@ -28,121 +23,43 @@ THUMB_MIN_VAL: OutEventValue = 0
 THUMB_NEUTRAL_VAL: OutEventValue = 128
 
 
-@dataclass(frozen=True)
-class KeyAction:
-    _: dataclasses.KW_ONLY
-    on_press: Callable[[], None]
-    on_release: Callable[[], None]
-
-    @staticmethod
-    def from_handler(handler: Callable[[bool], None]) -> "KeyAction":
-        return KeyAction(
-            on_press=functools.partial(handler, True),
-            on_release=functools.partial(handler, False),
-        )
+type InKeyAction = Callable[[bool], None]
+type InKeyListener = tuple[InKey, InKeyAction]
 
 
-@dataclass
-class OutThumbpadAxis:
-    """
-    Tracks state of a bidirectional input along an axis.
-    If both directions are pressed, they cancel each other until one is released.
-    """
-
-    device: "OutDevice"
-    event: OutEvent
-    hi: bool = dataclasses.field(default=False, init=False)
-    lo: bool = dataclasses.field(default=False, init=False)
-
-    def update_device(self):
-        self.device.emit(
-            self.event,
-            THUMB_NEUTRAL_VAL
-            if self.lo == self.hi
-            else (THUMB_MIN_VAL if self.lo else THUMB_MAX_VAL),
-        )
-
-    def send_lo(self, value: bool) -> None:
-        self.lo = value
-        self.update_device()
-
-    def send_hi(self, value: bool) -> None:
-        self.hi = value
-        self.update_device()
-
-
-class OutDevice:
-    def __init__(self) -> None:
-        # uinput values for ABS events: (min, max, fuzz, flat).
-        # shoulder triggers are treated as buttons.
-        thumb_dat = (THUMB_MIN_VAL, THUMB_MAX_VAL, 0, 0)
-        shoulder_dat = (BTN_UP_VAL, BTN_DOWN_VAL, 0, 0)
-
-        self.device = uinput.Device(
-            # WARN: Changing what events are available also affects what those events do!
-            # For example, removing ABS_RX and ABS_RY will cause ABS_Z and ABS_RZ to take
-            # their place. Check the input test in the steam controller settings and reset
-            # device inputs if weird things start happening.
-            [
-                # left thumbpad
-                uinput.ABS_X + thumb_dat,  # left/right
-                uinput.ABS_Y + thumb_dat,  # up/down
-                uinput.BTN_THUMBR,  # thumbpad press
-                # right thumbpad
-                uinput.ABS_RX + thumb_dat,  # left/right
-                uinput.ABS_RY + thumb_dat,  # up/down
-                uinput.BTN_THUMBL,  # thumbpad press
-                # analog shoulder triggers, treated as buttons
-                uinput.ABS_Z + shoulder_dat,  # left
-                uinput.ABS_RZ + shoulder_dat,  # right
-                # shoulder buttons
-                uinput.BTN_TL,
-                uinput.BTN_TR,
-                # "middle" buttons
-                uinput.BTN_START,
-                uinput.BTN_SELECT,
-                # ABXY
-                uinput.BTN_A,
-                uinput.BTN_B,
-                uinput.BTN_X,
-                uinput.BTN_Y,
-            ],
-            vendor=0x045E,
-            product=0x028E,
-            version=0x110,
-            name="Microsoft X-Box 360 pad",
-        )
-
-    def emit(self, event: OutEvent, value: OutEventValue) -> None:
+def build_keybinds(out_device: uinput.Device) -> Iterable[InKeyListener]:
+    def emit(event: OutEvent, value: OutEventValue) -> None:
         print(f"{event=}, {value=}")
-        self.device.emit(event, value)
+        out_device.emit(event, value)
 
-    def __enter__(self) -> Self:
-        self.device = self.device.__enter__()
-        return self
-
-    def __exit__(self, *args: object) -> bool:
-        return self.device.__exit__(*args)
-
-
-def build_keybinds(d: OutDevice) -> Iterable[Keybind]:
     def direction_keys_to_axis(
         *,
         lo_on: InKey,
         hi_on: InKey,
         send: OutEvent,
-    ) -> Iterable[Keybind]:
-        axis = OutThumbpadAxis(d, send)
+    ) -> Iterable[InKeyListener]:
+        lo_hi_state = [False, False]
+
+        def on_change(idx: Literal[0, 1], value: bool) -> None:
+            lo_hi_state[idx] = value
+            lo, hi = lo_hi_state
+            emit(
+                send,
+                THUMB_NEUTRAL_VAL
+                if lo == hi
+                else (THUMB_MIN_VAL if lo else THUMB_MAX_VAL),
+            )
+
         return (
-            (lo_on, KeyAction.from_handler(axis.send_lo)),
-            (hi_on, KeyAction.from_handler(axis.send_hi)),
+            (lo_on, functools.partial(on_change, 0)),
+            (hi_on, functools.partial(on_change, 1)),
         )
 
-    def key_to_button(*, on: InKey, send: OutEvent) -> Keybind:
+    def key_to_button(*, on: InKey, send: OutEvent) -> InKeyListener:
         def handler(pressed: bool) -> None:
-            d.emit(send, BTN_DOWN_VAL if pressed else BTN_UP_VAL)
+            emit(send, BTN_DOWN_VAL if pressed else BTN_UP_VAL)
 
-        return (on, KeyAction.from_handler(handler))
+        return (on, handler)
 
     return (
         # Movement keys
@@ -178,15 +95,55 @@ def build_keybinds(d: OutDevice) -> Iterable[Keybind]:
     )
 
 
+def create_device() -> uinput.Device:
+    # uinput values for ABS events: (min, max, fuzz, flat).
+    # shoulder triggers are treated as buttons.
+    thumb_dat = (THUMB_MIN_VAL, THUMB_MAX_VAL, 0, 0)
+    shoulder_dat = (BTN_UP_VAL, BTN_DOWN_VAL, 0, 0)
+
+    return uinput.Device(
+        # WARN: Changing what events are available also affects what those events do!
+        # For example, removing ABS_RX and ABS_RY will cause ABS_Z and ABS_RZ to take
+        # their place. Check the input test in the steam controller settings and reset
+        # device inputs if weird things start happening.
+        [
+            # analog left thumbpad
+            uinput.ABS_X + thumb_dat,  # left/right
+            uinput.ABS_Y + thumb_dat,  # up/down
+            uinput.BTN_THUMBR,  # thumbpad press
+            # analog right thumbpad
+            uinput.ABS_RX + thumb_dat,  # left/right
+            uinput.ABS_RY + thumb_dat,  # up/down
+            uinput.BTN_THUMBL,  # thumbpad press
+            # (analog) shoulder triggers
+            uinput.ABS_Z + shoulder_dat,  # left
+            uinput.ABS_RZ + shoulder_dat,  # right
+            # shoulder buttons
+            uinput.BTN_TL,
+            uinput.BTN_TR,
+            # "middle" buttons
+            uinput.BTN_START,
+            uinput.BTN_SELECT,
+            # ABXY
+            uinput.BTN_A,
+            uinput.BTN_B,
+            uinput.BTN_X,
+            uinput.BTN_Y,
+        ],
+        vendor=0x045E,
+        product=0x028E,
+        version=0x110,
+        name="Microsoft X-Box 360 pad",
+    )
+
+
 def main() -> None:
     devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
 
-    with OutDevice() as out_device:
-        keymap: dict[InKey, KeyAction] = {}
-        for k, a in build_keybinds(out_device):
-            if k in keymap:
-                raise ValueError(f"Duplicate key {k}")
-            keymap[k] = a
+    with create_device() as out_device:
+        keymap: dict[InKey, list[InKeyAction]] = {}
+        for on, action in build_keybinds(out_device):
+            keymap.setdefault(on, []).append(action)
 
         if not devices:
             print("No input devices found. Run as root?")
@@ -213,16 +170,16 @@ def main() -> None:
             if event.type != evdev.ecodes.EV_KEY:
                 continue
 
-            if (action := keymap.get(event.code)) is None:
-                continue
-
             key_event = evdev.categorize(event)
             if key_event.keystate == KeyEvent.key_down:
-                action.on_press()
+                pressed = True
             elif key_event.keystate == KeyEvent.key_up:
-                action.on_release()
+                pressed = False
             else:
                 continue
+
+            for act in keymap.get(event.code, ()):
+                act(pressed)
 
 
 if __name__ == "__main__":
