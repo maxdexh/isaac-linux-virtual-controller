@@ -1,16 +1,18 @@
 import dataclasses
-from typing import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+import functools
 
 import uinput  # type: ignore
 import evdev  # type: ignore
 from evdev import KeyEvent, ecodes
 
 
-type InKeyAction = Callable[[bool], None]
 type InKey = int
 type OutEvent = tuple[int, int]
 type OutEventValue = int
+type Keymap = Mapping[InKey, KeyAction]
+type Keybind = tuple[InKey, KeyAction]
 
 # Values for pressed and released.
 # Also used for the analog shoulder triggers
@@ -25,17 +27,24 @@ THUMB_MIN_VAL: OutEventValue = 0
 THUMB_NEUTRAL_VAL: OutEventValue = 128
 
 
-def simple_button(event: OutEvent) -> InKeyAction:
-    def handler(release):
-        OUT_DEVICE.emit(event, BTN_UP_VAL if release else BTN_DOWN_VAL)
+@dataclass(frozen=True)
+class KeyAction:
+    _: dataclasses.KW_ONLY
+    on_press: Callable[[], None]
+    on_release: Callable[[], None]
 
-    return handler
+    @staticmethod
+    def from_handler(handler: Callable[[bool], None]) -> "KeyAction":
+        return KeyAction(
+            on_press=functools.partial(handler, True),
+            on_release=functools.partial(handler, False),
+        )
 
 
 @dataclass
-class ThumbpadAxisState:
+class OutThumbpadAxis:
     """
-    State of a bidirectional input along an axis.
+    Tracks state of a bidirectional input along an axis.
     If both directions are pressed, they cancel each other until one is released.
     """
 
@@ -51,46 +60,13 @@ class ThumbpadAxisState:
             else (THUMB_MIN_VAL if self.lo else THUMB_MAX_VAL),
         )
 
-    def update_set_hi(self, release: bool):
-        self.hi = not release
+    def send_lo(self, value: bool) -> None:
+        self.lo = value
         self.update_device()
 
-    def update_set_lo(self, release: bool):
-        self.lo = not release
+    def send_hi(self, value: bool) -> None:
+        self.hi = value
         self.update_device()
-
-
-lpad_x = ThumbpadAxisState(uinput.ABS_X)  # left/right
-lpad_y = ThumbpadAxisState(uinput.ABS_Y)  # up/down
-
-
-# Maps keyboard keys to actions
-keymap: dict[int, Callable[[bool], None]] = {
-    # Movement keys
-    ecodes.KEY_A: lpad_x.update_set_lo,
-    ecodes.KEY_D: lpad_x.update_set_hi,
-    ecodes.KEY_W: lpad_y.update_set_lo,
-    ecodes.KEY_S: lpad_y.update_set_hi,
-    # Fire keys
-    ecodes.KEY_DOWN: simple_button(uinput.BTN_A),
-    ecodes.KEY_RIGHT: simple_button(uinput.BTN_B),
-    ecodes.KEY_LEFT: simple_button(uinput.BTN_X),
-    ecodes.KEY_UP: simple_button(uinput.BTN_Y),
-    # Use keys
-    ecodes.KEY_Q: simple_button(uinput.BTN_TR),
-    ecodes.KEY_E: simple_button(uinput.BTN_TL),
-    ecodes.KEY_SPACE: simple_button(uinput.ABS_Z),
-    # Other action keys
-    ecodes.KEY_LEFTCTRL: simple_button(uinput.ABS_RZ),
-    # Used to join multiplayer and interact with the map
-    ecodes.KEY_TAB: simple_button(uinput.BTN_SELECT),
-    # Hold together with thumbr to reset run
-    ecodes.KEY_J: simple_button(uinput.BTN_THUMBL),
-    # Emote
-    ecodes.KEY_K: simple_button(uinput.BTN_THUMBR),
-    # Join game (local multiplayer)
-    ecodes.KEY_4: simple_button(uinput.BTN_START),
-}
 
 
 class OutDevice:
@@ -98,7 +74,7 @@ class OutDevice:
         # uinput values for ABS events: (min, max, fuzz, flat).
         # shoulder triggers are treated as buttons.
         thumb_dat = (THUMB_MIN_VAL, THUMB_MAX_VAL, 0, 0)
-        shoulder_dat = (BTN_DOWN_VAL, BTN_UP_VAL, 0, 0)
+        shoulder_dat = (BTN_UP_VAL, BTN_DOWN_VAL, 0, 0)
 
         self.device = uinput.Device(
             # WARN: Changing what events are available also affects what those events do!
@@ -140,10 +116,75 @@ class OutDevice:
         self.device.emit(event, value)
 
 
+def get_keybinds() -> Iterable[Keybind]:
+    def simple_button(event: OutEvent) -> KeyAction:
+        def handler(pressed: bool) -> None:
+            OUT_DEVICE.emit(event, BTN_DOWN_VAL if pressed else BTN_UP_VAL)
+
+        return KeyAction.from_handler(handler)
+
+    def direction_keys_to_axis(
+        *,
+        lo_on: InKey,
+        hi_on: InKey,
+        send: OutEvent,
+    ) -> Iterable[Keybind]:
+        axis = OutThumbpadAxis(send)
+        return (
+            (lo_on, KeyAction.from_handler(axis.send_lo)),
+            (hi_on, KeyAction.from_handler(axis.send_hi)),
+        )
+
+    def key_to_button(*, on: InKey, send: OutEvent) -> Keybind:
+        def handler(pressed: bool) -> None:
+            OUT_DEVICE.emit(send, BTN_DOWN_VAL if pressed else BTN_UP_VAL)
+
+        return (on, KeyAction.from_handler(handler))
+
+    return (
+        # Movement keys
+        *direction_keys_to_axis(
+            lo_on=ecodes.KEY_A,
+            hi_on=ecodes.KEY_D,
+            send=uinput.ABS_X,
+        ),
+        *direction_keys_to_axis(
+            lo_on=ecodes.KEY_W,
+            hi_on=ecodes.KEY_S,
+            send=uinput.ABS_Y,
+        ),
+        # Fire keys
+        key_to_button(on=ecodes.KEY_DOWN, send=uinput.BTN_A),
+        key_to_button(on=ecodes.KEY_RIGHT, send=uinput.BTN_B),
+        key_to_button(on=ecodes.KEY_LEFT, send=uinput.BTN_X),
+        key_to_button(on=ecodes.KEY_UP, send=uinput.BTN_Y),
+        # Use keys
+        key_to_button(on=ecodes.KEY_Q, send=uinput.BTN_TR),
+        key_to_button(on=ecodes.KEY_E, send=uinput.BTN_TL),
+        key_to_button(on=ecodes.KEY_SPACE, send=uinput.ABS_Z),
+        # Other action keys
+        key_to_button(on=ecodes.KEY_LEFTCTRL, send=uinput.ABS_RZ),
+        # Used to join multiplayer and interact with the map
+        key_to_button(on=ecodes.KEY_TAB, send=uinput.BTN_SELECT),
+        # Hold together with thumbr to reset run
+        key_to_button(on=ecodes.KEY_J, send=uinput.BTN_THUMBL),
+        # Emote
+        key_to_button(on=ecodes.KEY_K, send=uinput.BTN_THUMBR),
+        # Join game (local multiplayer)
+        key_to_button(on=ecodes.KEY_4, send=uinput.BTN_START),
+    )
+
+
 OUT_DEVICE = OutDevice()
 
 
-def main():
+def main() -> None:
+    keymap: dict[InKey, KeyAction] = {}
+    for k, a in get_keybinds():
+        if k in keymap:
+            raise ValueError(f"Duplicate key {k}")
+        keymap[k] = a
+
     devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
 
     if not devices:
@@ -171,19 +212,16 @@ def main():
         if event.type != evdev.ecodes.EV_KEY:
             continue
 
-        key_event = evdev.categorize(event)
-
         if (action := keymap.get(event.code)) is None:
             continue
 
+        key_event = evdev.categorize(event)
         if key_event.keystate == KeyEvent.key_down:
-            release = False
+            action.on_press()
         elif key_event.keystate == KeyEvent.key_up:
-            release = True
+            action.on_release()
         else:
             continue
-
-        action(release)
 
 
 if __name__ == "__main__":
