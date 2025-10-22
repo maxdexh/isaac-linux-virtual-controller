@@ -1,4 +1,5 @@
-from typing import Callable, Any
+import dataclasses
+from typing import Callable
 from dataclasses import dataclass
 
 import uinput  # type: ignore
@@ -6,33 +7,49 @@ import evdev  # type: ignore
 from evdev import KeyEvent, ecodes
 
 
-type Keybind = Callable[[bool], None]
-type Key = Any
-type Event = tuple
+type InKeyAction = Callable[[bool], None]
+type InKey = int
+type OutEvent = tuple[int, int]
+type OutEventValue = int
+
+# Values for pressed and released.
+# Also used for the analog shoulder triggers
+BTN_DOWN_VAL: OutEventValue = 1
+BTN_UP_VAL: OutEventValue = 0
+
+# Thumbpad values along one axis. neutral is no
+# deflection, the others are full deflection,
+# with direction depending on event
+THUMB_MAX_VAL: OutEventValue = 255
+THUMB_MIN_VAL: OutEventValue = 0
+THUMB_NEUTRAL_VAL: OutEventValue = 128
 
 
-def simple_button(event: Event) -> Keybind:
+def simple_button(event: OutEvent) -> InKeyAction:
     def handler(release):
-        emit(event, 0 if release else 1)
+        OUT_DEVICE.emit(event, BTN_UP_VAL if release else BTN_DOWN_VAL)
 
     return handler
 
 
-# State of the left thumbpad, whether each direction is pressed
-# (opposite directions can be pressed and cancel out until one is released)
 @dataclass
-class ThumbstickAxisState:
+class ThumbpadAxisState:
     """
     State of a bidirectional input along an axis.
-    If both directions are pressed, they will cancel each other until one is released
+    If both directions are pressed, they cancel each other until one is released.
     """
 
-    event: Event
-    hi: bool = False
-    lo: bool = False
+    event: OutEvent
+    hi: bool = dataclasses.field(default=False, init=False)
+    lo: bool = dataclasses.field(default=False, init=False)
 
     def update_device(self):
-        emit(self.event, 128 if self.lo == self.hi else (0 if self.lo else 255))
+        OUT_DEVICE.emit(
+            self.event,
+            THUMB_NEUTRAL_VAL
+            if self.lo == self.hi
+            else (THUMB_MIN_VAL if self.lo else THUMB_MAX_VAL),
+        )
 
     def update_set_hi(self, release: bool):
         self.hi = not release
@@ -43,8 +60,8 @@ class ThumbstickAxisState:
         self.update_device()
 
 
-lpad_x = ThumbstickAxisState(uinput.ABS_X)  # left/right
-lpad_y = ThumbstickAxisState(uinput.ABS_Y)  # up/down
+lpad_x = ThumbpadAxisState(uinput.ABS_X)  # left/right
+lpad_y = ThumbpadAxisState(uinput.ABS_Y)  # up/down
 
 
 # Maps keyboard keys to actions
@@ -75,45 +92,55 @@ keymap: dict[int, Callable[[bool], None]] = {
     ecodes.KEY_4: simple_button(uinput.BTN_START),
 }
 
-device = uinput.Device(
-    # WARN: Changing what events are available also affects what those events do!
-    # For example, removing ABS_RX and ABS_RY will cause ABS_Z and ABS_RZ to take
-    # their place. Check the input test in the steam controller settings and reset
-    # device inputs if weird things start happening.
-    [
-        # left thumbpad
-        uinput.ABS_X + (0, 255, 0, 0),  # left/right
-        uinput.ABS_Y + (0, 255, 0, 0),  # up/down
-        uinput.BTN_THUMBR,  # thumbpad press
-        # right thumbpad
-        uinput.ABS_RX + (0, 255, 0, 0),  # left/right
-        uinput.ABS_RY + (0, 255, 0, 0),  # up/down
-        uinput.BTN_THUMBL,  # thumbpad press
-        # analog triggers
-        uinput.ABS_Z + (0, 1, 0, 0),  # left
-        uinput.ABS_RZ + (0, 1, 0, 0),  # right
-        # sholder buttons
-        uinput.BTN_TL,
-        uinput.BTN_TR,
-        # "middle" buttons
-        uinput.BTN_START,
-        uinput.BTN_SELECT,
-        # ABXY
-        uinput.BTN_A,
-        uinput.BTN_B,
-        uinput.BTN_X,
-        uinput.BTN_Y,
-    ],
-    vendor=0x045E,
-    product=0x028E,
-    version=0x110,
-    name="Microsoft X-Box 360 pad",
-)
+
+class OutDevice:
+    def __init__(self) -> None:
+        # uinput values for ABS events: (min, max, fuzz, flat).
+        # shoulder triggers are treated as buttons.
+        thumb_dat = (THUMB_MIN_VAL, THUMB_MAX_VAL, 0, 0)
+        shoulder_dat = (BTN_DOWN_VAL, BTN_UP_VAL, 0, 0)
+
+        self.device = uinput.Device(
+            # WARN: Changing what events are available also affects what those events do!
+            # For example, removing ABS_RX and ABS_RY will cause ABS_Z and ABS_RZ to take
+            # their place. Check the input test in the steam controller settings and reset
+            # device inputs if weird things start happening.
+            [
+                # left thumbpad
+                uinput.ABS_X + thumb_dat,  # left/right
+                uinput.ABS_Y + thumb_dat,  # up/down
+                uinput.BTN_THUMBR,  # thumbpad press
+                # right thumbpad
+                uinput.ABS_RX + thumb_dat,  # left/right
+                uinput.ABS_RY + thumb_dat,  # up/down
+                uinput.BTN_THUMBL,  # thumbpad press
+                # analog shoulder triggers, treated as buttons
+                uinput.ABS_Z + shoulder_dat,  # left
+                uinput.ABS_RZ + shoulder_dat,  # right
+                # shoulder buttons
+                uinput.BTN_TL,
+                uinput.BTN_TR,
+                # "middle" buttons
+                uinput.BTN_START,
+                uinput.BTN_SELECT,
+                # ABXY
+                uinput.BTN_A,
+                uinput.BTN_B,
+                uinput.BTN_X,
+                uinput.BTN_Y,
+            ],
+            vendor=0x045E,
+            product=0x028E,
+            version=0x110,
+            name="Microsoft X-Box 360 pad",
+        )
+
+    def emit(self, event: OutEvent, value: OutEventValue) -> None:
+        print(f"{event=}, {value=}")
+        self.device.emit(event, value)
 
 
-def emit(*args, **kwargs):
-    print(args, kwargs)
-    device.emit(*args, **kwargs)
+OUT_DEVICE = OutDevice()
 
 
 def main():
