@@ -2,6 +2,7 @@ import dataclasses
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 import functools
+from typing import Self
 
 import uinput  # type: ignore
 import evdev  # type: ignore
@@ -48,12 +49,13 @@ class OutThumbpadAxis:
     If both directions are pressed, they cancel each other until one is released.
     """
 
+    device: "OutDevice"
     event: OutEvent
     hi: bool = dataclasses.field(default=False, init=False)
     lo: bool = dataclasses.field(default=False, init=False)
 
     def update_device(self):
-        OUT_DEVICE.emit(
+        self.device.emit(
             self.event,
             THUMB_NEUTRAL_VAL
             if self.lo == self.hi
@@ -115,21 +117,22 @@ class OutDevice:
         print(f"{event=}, {value=}")
         self.device.emit(event, value)
 
+    def __enter__(self) -> Self:
+        self.device = self.device.__enter__()
+        return self
 
-def get_keybinds() -> Iterable[Keybind]:
-    def simple_button(event: OutEvent) -> KeyAction:
-        def handler(pressed: bool) -> None:
-            OUT_DEVICE.emit(event, BTN_DOWN_VAL if pressed else BTN_UP_VAL)
+    def __exit__(self, *args: object) -> bool:
+        return self.device.__exit__(*args)
 
-        return KeyAction.from_handler(handler)
 
+def build_keybinds(d: OutDevice) -> Iterable[Keybind]:
     def direction_keys_to_axis(
         *,
         lo_on: InKey,
         hi_on: InKey,
         send: OutEvent,
     ) -> Iterable[Keybind]:
-        axis = OutThumbpadAxis(send)
+        axis = OutThumbpadAxis(d, send)
         return (
             (lo_on, KeyAction.from_handler(axis.send_lo)),
             (hi_on, KeyAction.from_handler(axis.send_hi)),
@@ -137,7 +140,7 @@ def get_keybinds() -> Iterable[Keybind]:
 
     def key_to_button(*, on: InKey, send: OutEvent) -> Keybind:
         def handler(pressed: bool) -> None:
-            OUT_DEVICE.emit(send, BTN_DOWN_VAL if pressed else BTN_UP_VAL)
+            d.emit(send, BTN_DOWN_VAL if pressed else BTN_UP_VAL)
 
         return (on, KeyAction.from_handler(handler))
 
@@ -175,54 +178,57 @@ def get_keybinds() -> Iterable[Keybind]:
     )
 
 
-OUT_DEVICE = OutDevice()
-
-
 def main() -> None:
-    keymap: dict[InKey, KeyAction] = {}
-    for k, a in get_keybinds():
-        if k in keymap:
-            raise ValueError(f"Duplicate key {k}")
-        keymap[k] = a
-
     devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
 
-    if not devices:
-        print("No input devices found. Run as root?")
-        return
+    with OutDevice() as out_device:
+        keymap: dict[InKey, KeyAction] = {}
+        for k, a in build_keybinds(out_device):
+            if k in keymap:
+                raise ValueError(f"Duplicate key {k}")
+            keymap[k] = a
 
-    print("Available devices:")
-    for i, device in enumerate(devices):
-        print(device.path, device.name, device.phys)
+        if not devices:
+            print("No input devices found. Run as root?")
+            return
 
-    while True:
-        try:
-            print()
-            device_id = int(input("Pick device /dev/input/event[...]: "))
-            device = next(
-                device
-                for device in devices
-                if device.path.endswith(f"event{device_id}")
-            )
-            break
-        except Exception:
-            pass
+        print("Available devices:")
+        for i, device in enumerate(devices):
+            print(device.path, device.name, device.phys)
 
-    for event in device.read_loop():
-        if event.type != evdev.ecodes.EV_KEY:
-            continue
+        while True:
+            try:
+                print()
+                device_id = int(input("Pick device /dev/input/event[...]: "))
+                device = next(
+                    device
+                    for device in devices
+                    if device.path.endswith(f"event{device_id}")
+                )
+                break
+            except Exception:
+                pass
 
-        if (action := keymap.get(event.code)) is None:
-            continue
+        for event in device.read_loop():
+            if event.type != evdev.ecodes.EV_KEY:
+                continue
 
-        key_event = evdev.categorize(event)
-        if key_event.keystate == KeyEvent.key_down:
-            action.on_press()
-        elif key_event.keystate == KeyEvent.key_up:
-            action.on_release()
-        else:
-            continue
+            if (action := keymap.get(event.code)) is None:
+                continue
+
+            key_event = evdev.categorize(event)
+            if key_event.keystate == KeyEvent.key_down:
+                action.on_press()
+            elif key_event.keystate == KeyEvent.key_up:
+                action.on_release()
+            else:
+                continue
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        import sys
+
+        sys.exit(130)
