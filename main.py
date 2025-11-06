@@ -102,10 +102,10 @@ def create_device() -> uinput.Device:
     shoulder_dat = (BTN_UP_VAL, BTN_DOWN_VAL, 0, 0)
 
     return uinput.Device(
-        # WARN: Changing what events are available also affects what those events do!
+        # WARN: Changing which events are available also affects what those events do!
         # For example, removing ABS_RX and ABS_RY will cause ABS_Z and ABS_RZ to take
-        # their place. Check the input test in the steam controller settings and reset
-        # device inputs if weird things start happening.
+        # their place. Check the input test in the steam controller settings and use
+        # "Reset Device Inputs" when changing this.
         [
             # analog left thumbpad
             uinput.ABS_X + thumb_dat,  # left/right
